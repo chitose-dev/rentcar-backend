@@ -312,6 +312,92 @@ async function sendReminders() {
 
 ---
 
+## 開発環境セットアップ
+
+### 前提条件
+- Node.js 20.x
+- pnpm (推奨) または npm
+- Firebase CLIがインストール済み
+- Google Cloud SDKがインストール済み
+- Stripeアカウント（テスト環境）
+- Resendアカウント
+
+### 初期セットアップ
+
+```bash
+# 1. リポジトリクローン
+git clone <repository-url>
+cd rent-backend
+
+# 2. 依存関係インストール
+pnpm install
+
+# 3. Firebase設定
+firebase login
+firebase use --add  # プロジェクトを選択
+
+# 4. サービスアカウントキー取得
+# Firebase Console → プロジェクト設定 → サービスアカウント → 新しい秘密鍵を生成
+# ダウンロードしたJSONを ./service-account.json として保存
+
+# 5. 環境変数設定
+cp .env.example .env
+# .envを編集して各種キーを設定
+
+# 6. Firestore初期データ投入（オプション）
+pnpm run seed
+
+# 7. 管理者初期作成
+pnpm run seed:admin --email admin@example.com --password AdminPass123
+
+# または Firebase Console から直接 admins コレクションに追加
+# passwordHash は bcrypt(cost=12) でハッシュ化した値を設定
+
+# 8. 開発サーバー起動
+pnpm run dev
+```
+
+### ローカル開発
+
+```bash
+# 開発サーバー（ホットリロード）
+pnpm run dev
+
+# 型チェック
+pnpm run typecheck
+
+# リント
+pnpm run lint
+
+# テスト
+pnpm run test
+
+# テスト（カバレッジ）
+pnpm run test:coverage
+```
+
+### Stripe Webhook ローカルテスト
+
+```bash
+# Stripe CLIでWebhookをローカルに転送
+stripe listen --forward-to localhost:3000/v1/stripe/webhook
+
+# 別ターミナルでテストイベント発火
+stripe trigger checkout.session.completed
+```
+
+### Firestore Emulator（オプション）
+
+```bash
+# エミュレータ起動
+firebase emulators:start --only firestore
+
+# 環境変数でエミュレータを使用
+FIRESTORE_EMULATOR_HOST=localhost:8080 pnpm run dev
+```
+
+---
+
 ## 環境変数
 
 ```env

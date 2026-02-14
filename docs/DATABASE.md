@@ -201,7 +201,37 @@
   name: string,                  // "ETC車載器"
   description: string,
   pricePerDay: number,
-  maxQuantity: number,           // 在庫数
+  maxQuantity: number,           // 同時貸出可能な最大数（全体在庫）
+  isActive: boolean,
+  sortOrder: number,
+  createdAt: Timestamp,
+  updatedAt: Timestamp
+}
+```
+
+**在庫管理:**
+- `maxQuantity`は全体在庫数（同時にレンタル可能な最大数）
+- 予約作成時に期間内の他予約で使用中の数を計算し、空きを確認
+- 例: maxQuantity=5、同期間に3つ予約済み → 残り2つ利用可能
+
+---
+
+### insurancePlans（保険プラン）
+
+```javascript
+{
+  id: string,                    // 'none' | 'standard' | 'premium'
+  name: string,                  // "スタンダード補償"
+  description: string,
+  pricePerDay: number,           // 日額料金
+  deductible: number | null,     // 免責金額（'none'プランはnull）
+  coverageDetails: {
+    personalLiability: string,   // "無制限"
+    propertyDamage: string,      // "無制限"
+    vehicleDamage: string,       // "時価額まで"
+    nocCoverage: boolean,        // NOC補償
+    roadService: boolean         // ロードサービス
+  },
   isActive: boolean,
   sortOrder: number,
   createdAt: Timestamp,
@@ -261,7 +291,13 @@
   paymentStatus: 'pending' | 'paid' | 'refunded' | 'partial_refund',
   stripePaymentIntentId: string | null,
   stripeCheckoutSessionId: string | null,
+  paymentExpiresAt: Timestamp | null,    // Checkout Session期限（pending_payment時のみ）
   paidAt: Timestamp | null,
+  
+  // 返金情報
+  stripeRefundId: string | null,
+  refundStatus: 'none' | 'pending' | 'completed' | 'failed' | 'manual_required' | null,
+  refundError: string | null,            // 返金失敗時のエラーメッセージ
   
   // ステータス
   status: 'pending_payment' | 'confirmed' | 'picked_up' | 'returned' | 'cancel_requested' | 'cancelled' | 'no_show',
@@ -311,17 +347,20 @@
 ```javascript
 {
   id: string,
-  userId: string,
-  type: 'email_verify' | 'password_reset' | 'login_2fa',
+  userId: string | null,         // パスワードリセット時はnullの場合あり
+  email: string,                 // 検索用（パスワードリセット時に必要）
+  type: 'email_verify' | 'password_reset' | 'login_2fa' | 'admin_2fa',
   code: string,                  // 6桁
   expiresAt: Timestamp,
   used: boolean,
+  attempts: number,              // 試行回数（2FA用）
   createdAt: Timestamp
 }
 ```
 
 **インデックス:**
 - `userId, type, used` (複合)
+- `email, type, used` (複合) - パスワードリセット用
 - `expiresAt` (単一) - TTL用
 
 ---
@@ -393,6 +432,47 @@
 
 ---
 
+### adminActions（管理者操作ログ）
+
+```javascript
+{
+  id: string,
+  adminId: string,
+  adminEmail: string,            // 非正規化
+  action: string,                // アクション種別（下記参照）
+  targetType: 'reservation' | 'user' | 'vehicle' | 'carClass' | 'option' | 'settings',
+  targetId: string | null,
+  details: object,               // アクション固有のデータ
+  ipAddress: string,
+  userAgent: string,
+  createdAt: Timestamp
+}
+```
+
+**アクション種別:**
+- `reservation.pickup` - 受取処理
+- `reservation.return` - 返却処理
+- `reservation.extend` - 延長処理
+- `reservation.cancel.approve` - キャンセル承認
+- `reservation.cancel.reject` - キャンセル却下
+- `reservation.no_show` - 無断キャンセル処理
+- `reservation.create_manual` - 手動予約作成
+- `user.suspend` - 会員停止
+- `user.unsuspend` - 会員停止解除
+- `vehicle.create` - 車両追加
+- `vehicle.update` - 車両更新
+- `vehicle.maintenance.start` - メンテナンス開始
+- `vehicle.maintenance.end` - メンテナンス終了
+- `settings.update` - 設定更新
+- `refund.manual` - 手動返金処理
+
+**インデックス:**
+- `adminId, createdAt` (複合)
+- `targetType, targetId` (複合)
+- `action, createdAt` (複合)
+
+---
+
 ## クエリパターン
 
 ### 車両在庫確認（予約時）
@@ -437,13 +517,53 @@ const reminders = await db.collection('reservations')
   .get();
 ```
 
+### オプション在庫確認（予約時）
+
+```javascript
+// 指定期間内のオプション空き数を計算
+async function checkOptionAvailability(optionId, quantity, pickupAt, returnAt) {
+  const option = await db.collection('options').doc(optionId).get();
+  const maxQuantity = option.data().maxQuantity;
+  
+  // 期間が重複する予約のオプション使用数を集計
+  const overlappingReservations = await db.collection('reservations')
+    .where('status', 'in', ['confirmed', 'picked_up', 'pending_payment'])
+    .where('pickupAt', '<', returnAt)
+    .get();
+  
+  let usedQuantity = 0;
+  overlappingReservations.forEach(doc => {
+    const res = doc.data();
+    // 返却日時が受取日時より後の場合のみカウント
+    if (res.returnAt.toDate() > pickupAt) {
+      const opt = res.options?.find(o => o.optionId === optionId);
+      if (opt) usedQuantity += opt.quantity;
+    }
+  });
+  
+  // 残り在庫 >= 要求数 なら利用可能
+  return (maxQuantity - usedQuantity) >= quantity;
+}
+
+// 使用例
+const canUseETC = await checkOptionAvailability(
+  'opt-001',  // ETC車載器
+  1,          // 数量
+  new Date('2026-02-15T10:00:00+09:00'),
+  new Date('2026-02-17T18:00:00+09:00')
+);
+```
+
 ---
 
 ## トランザクション必須処理
 
-1. **予約作成**: 車両割り当て + 予約作成 + 在庫数更新
+1. **予約作成**: 車両割り当て + オプション在庫確認 + 予約作成 + 在庫数更新
 2. **予約キャンセル**: 予約更新 + 車両解放 + 在庫数更新
 3. **車両メンテナンス設定**: 車両更新 + 予約確認
+4. **予約延長**: 車両空き確認 + 予約更新（競合防止）
+5. **予約ID採番**: 日別カウンター取得 + インクリメント + 予約作成
+6. **オプション在庫確認**: 予約作成時に同時実行（競合防止のためトランザクション内で実施）
 
 ---
 
